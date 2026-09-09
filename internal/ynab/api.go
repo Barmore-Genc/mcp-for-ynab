@@ -29,8 +29,12 @@ type API struct {
 	cache *cache
 }
 
-func NewAPI(token string) (*API, error) {
-	c, err := NewClient(BaseURL, WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
+func NewAPI(token string) (*API, error) { return NewAPIAt(token, BaseURL) }
+
+// NewAPIAt points the client at a different base URL. It exists for tests and
+// for anyone running YNAB's API behind a proxy of their own.
+func NewAPIAt(token, baseURL string) (*API, error) {
+	c, err := NewClient(baseURL, WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/json")
 		return nil
