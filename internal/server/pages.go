@@ -27,6 +27,7 @@ const pageCSS = `
     border: 1px solid var(--line); background: var(--bg); color: var(--text);
     box-sizing: border-box; }
   .row { display: flex; gap: .75rem; margin-top: 1.5rem; }
+  p.sso { margin-top: 1rem; }
   button { flex: 1; padding: .7rem; border-radius: 8px; border: 0; font-size: .95rem;
     font-weight: 600; cursor: pointer; }
   .allow { background: var(--accent); color: #fff; }
@@ -50,6 +51,14 @@ var loginTmpl = template.Must(template.New("login").Parse(`<!doctype html>
     <input type="hidden" name="code_challenge_method" value="S256">
     <input type="hidden" name="response_type" value="code">
     <input type="hidden" name="scope" value="{{.P.Scope}}">
+    {{if .SSO}}
+    <p class="sso">You will be taken to <strong>{{.ProviderName}}</strong> to sign in.</p>
+    {{if .Error}}<p class="err">{{.Error}}</p>{{end}}
+    <div class="row">
+      <button class="deny" type="submit" name="decision" value="deny">Cancel</button>
+      <button class="allow" type="submit" name="decision" value="allow">Continue with {{.ProviderName}}</button>
+    </div>
+    {{else}}
     <label for="username">Username</label>
     <input id="username" name="username" autocomplete="username" autofocus required>
     <label for="password">Password</label>
@@ -59,18 +68,29 @@ var loginTmpl = template.Must(template.New("login").Parse(`<!doctype html>
       <button class="deny" type="submit" name="decision" value="deny">Cancel</button>
       <button class="allow" type="submit" name="decision" value="allow">Sign in</button>
     </div>
+    {{end}}
   </form>
 </div></body></html>`))
 
-func renderLogin(w http.ResponseWriter, p authorizeParams, errMsg string) {
+// renderLogin shows the consent page for a validated /authorize request. With
+// an identity provider configured the form asks for no password of its own; it
+// is just the consent step before the browser leaves for the provider.
+func (s *Server) renderLogin(w http.ResponseWriter, p authorizeParams, errMsg string) {
 	if p.ClientName == "" {
 		p.ClientName = "An application"
 	}
+	view := struct {
+		P            authorizeParams
+		Error        string
+		SSO          bool
+		ProviderName string
+	}{P: p, Error: errMsg}
+	if s.oidc != nil {
+		view.SSO = true
+		view.ProviderName = s.oidc.Name()
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	loginTmpl.Execute(w, struct {
-		P     authorizeParams
-		Error string
-	}{p, errMsg})
+	loginTmpl.Execute(w, view)
 }
 
 var errorTmpl = template.Must(template.New("error").Parse(`<!doctype html>

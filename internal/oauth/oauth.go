@@ -34,6 +34,10 @@ const (
 	CodeTTL    = time.Minute
 	AccessTTL  = time.Hour
 	RefreshTTL = 30 * 24 * time.Hour
+	// OIDCFlowTTL bounds the upstream leg of an OIDC sign-in. It is longer than
+	// CodeTTL because the person has to leave this server, sign in at their
+	// identity provider and come back, but it is still only a sign-in.
+	OIDCFlowTTL = 10 * time.Minute
 )
 
 // Credential kinds, carried in the payload so a token of one kind can never be
@@ -43,6 +47,10 @@ const (
 	KindCode    = "code"
 	KindAccess  = "access"
 	KindRefresh = "refresh"
+	// KindOIDC is the signed state this server hands an identity provider and
+	// expects back on the callback. It carries the original authorization
+	// request through the trip so nothing has to be remembered server-side.
+	KindOIDC = "oidc"
 )
 
 var ErrInvalid = errors.New("invalid credential")
@@ -60,7 +68,16 @@ type Payload struct {
 	RedirectURI  string   `json:"u,omitempty"`
 	Challenge    string   `json:"h,omitempty"`
 	Scope        string   `json:"s,omitempty"`
-	Expires      int64    `json:"e"`
+	// ClientState is the state the MCP client sent to /authorize. It is carried
+	// through the OIDC round trip so it can be echoed back to the client's
+	// redirect_uri exactly as the local form echoes it.
+	ClientState string `json:"cs,omitempty"`
+	// Nonce and Verifier belong to the upstream OIDC leg: the nonce is checked
+	// against the ID token, and the verifier against the code the provider
+	// returns. Neither is ever given to the MCP client.
+	Nonce    string `json:"no,omitempty"`
+	Verifier string `json:"cv,omitempty"`
+	Expires  int64  `json:"e"`
 }
 
 func (p Payload) ExpiresAt() time.Time { return time.Unix(p.Expires, 0) }
@@ -164,6 +181,16 @@ func VerifyS256(verifier, challenge string) bool {
 // RandomID returns 128 bits of entropy as base64url.
 func RandomID() string {
 	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("oauth: read random: %v", err))
+	}
+	return base64.RawURLEncoding.EncodeToString(b[:])
+}
+
+// RandomVerifier returns a PKCE code verifier: 32 bytes of entropy as
+// base64url, which is the 43-character minimum RFC 7636 allows.
+func RandomVerifier() string {
+	var b [32]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		panic(fmt.Sprintf("oauth: read random: %v", err))
 	}

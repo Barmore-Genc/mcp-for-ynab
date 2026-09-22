@@ -8,11 +8,13 @@ import (
 
 	"github.com/Barmore-Genc/mcp-for-ynab/internal/config"
 	"github.com/Barmore-Genc/mcp-for-ynab/internal/oauth"
+	"github.com/Barmore-Genc/mcp-for-ynab/internal/oidc"
 )
 
 type Server struct {
 	cfg     config.Config
 	signer  *oauth.Signer
+	oidc    *oidc.Provider
 	limiter *limiter
 	mux     *http.ServeMux
 }
@@ -21,6 +23,9 @@ type Server struct {
 // bearer check against the same signer.
 func New(cfg config.Config, signer *oauth.Signer, mcpHandler http.Handler) *Server {
 	s := &Server{cfg: cfg, signer: signer, limiter: newLimiter(), mux: http.NewServeMux()}
+	if cfg.OIDC != nil {
+		s.oidc = oidc.New(*cfg.OIDC)
+	}
 	s.registerOAuthRoutes()
 	s.mux.Handle("/mcp", mcpHandler)
 	s.mux.Handle("/mcp/", mcpHandler)
