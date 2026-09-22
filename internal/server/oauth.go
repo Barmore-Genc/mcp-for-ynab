@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Barmore-Genc/mcp-for-ynab/internal/oauth"
+	"github.com/Barmore-Genc/mcp-for-ynab/internal/oidc"
 )
 
 // scopeYNAB is the only scope. There is one user and one YNAB token behind this
@@ -31,6 +34,10 @@ func (s *Server) registerOAuthRoutes() {
 	s.mux.HandleFunc("GET /authorize", s.handleAuthorize)
 	s.mux.HandleFunc("POST /authorize", s.handleAuthorizeSubmit)
 	s.mux.HandleFunc("POST /token", s.handleToken)
+	// The callback is where an OIDC provider returns the browser. It exists
+	// whether or not a provider is configured so a stale bookmark gets an
+	// explanation rather than a 404.
+	s.mux.HandleFunc("GET /oidc/callback", s.handleOIDCCallback)
 }
 
 func (s *Server) handleResourceMetadata(w http.ResponseWriter, r *http.Request) {
@@ -167,13 +174,13 @@ func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 		s.authorizeError(w, r, p, redirectOK, errMsg)
 		return
 	}
-	renderLogin(w, p, "")
+	s.renderLogin(w, p, "")
 }
 
-// handleAuthorizeSubmit is the login form. There is no session cookie and no
-// separate consent step: the operator proves who they are by typing the
-// credentials from the container's environment, and doing so on a form that
-// names the client asking is the consent.
+// handleAuthorizeSubmit is the consent form. There is no session cookie and no
+// separate consent step: with a local password the operator types it here, and
+// with OIDC they click through to the provider; either way, submitting a form
+// that names the client asking is the consent.
 func (s *Server) handleAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		renderErrorPage(w, http.StatusBadRequest, "malformed form")
@@ -188,6 +195,13 @@ func (s *Server) handleAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		redirectAuthError(w, r, p, "access_denied")
 		return
 	}
+	// With a provider configured the local password is not consulted at all:
+	// the operator continues at the provider and comes back through
+	// /oidc/callback with a verified identity.
+	if s.oidc != nil {
+		s.startOIDC(w, r, p)
+		return
+	}
 	if !s.limiter.allow(clientIP(r)) {
 		renderErrorPage(w, http.StatusTooManyRequests, "too many sign-in attempts, wait a minute and try again")
 		return
@@ -196,7 +210,7 @@ func (s *Server) handleAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		// The form is re-rendered rather than redirected so the request keeps
 		// its parameters without them landing in browser history.
 		w.WriteHeader(http.StatusUnauthorized)
-		renderLogin(w, p, "Wrong username or password.")
+		s.renderLogin(w, p, "Wrong username or password.")
 		return
 	}
 	s.limiter.reset(clientIP(r))
@@ -208,6 +222,119 @@ func (s *Server) handleAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		Scope:       scopeYNAB,
 	}, oauth.CodeTTL)
 	redirectWithCode(w, r, p, code)
+}
+
+// startOIDC redirects the browser to the identity provider. Everything the
+// callback needs to resume the original request travels in the signed state,
+// so the server remembers nothing between the two halves of the flow. The nonce
+// ties the ID token back to this sign-in and the verifier is this server's PKCE
+// secret for the upstream exchange.
+func (s *Server) startOIDC(w http.ResponseWriter, r *http.Request, p authorizeParams) {
+	nonce := oauth.RandomID()
+	verifier := oauth.RandomVerifier()
+	state := s.signer.Mint(oauth.Payload{
+		Kind:        oauth.KindOIDC,
+		ClientID:    p.ClientID,
+		ClientName:  p.ClientName,
+		RedirectURI: p.RedirectURI,
+		Challenge:   p.Challenge,
+		Scope:       p.Scope,
+		ClientState: p.State,
+		Nonce:       nonce,
+		Verifier:    verifier,
+	}, oauth.OIDCFlowTTL)
+
+	// Discovery is cached but the first sign-in fetches it, and the provider
+	// may be slow or down; bound it so the request cannot hang forever.
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	authURL, err := s.oidc.AuthCodeURL(ctx, state, nonce, verifier)
+	if err != nil {
+		log.Printf("oidc: build authorization URL: %v", err)
+		renderErrorPage(w, http.StatusBadGateway,
+			"Could not reach the identity provider. Check the MCP_OIDC_ settings and that the provider is reachable.")
+		return
+	}
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+// handleOIDCCallback completes the upstream sign-in. It verifies the signed
+// state, redeems the code at the provider, checks the ID token and the
+// allowlist, and only then mints the local authorization code the MCP client
+// has been waiting for.
+func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
+	if s.oidc == nil {
+		renderErrorPage(w, http.StatusNotFound, "This server is not configured for OIDC sign-in.")
+		return
+	}
+	q := r.URL.Query()
+	p, err := s.signer.Verify(q.Get("state"), oauth.KindOIDC)
+	if err != nil {
+		renderErrorPage(w, http.StatusBadRequest,
+			"This sign-in link is invalid or has expired. Start again from your agent.")
+		return
+	}
+	ap := authorizeParams{
+		ClientID:    p.ClientID,
+		ClientName:  p.ClientName,
+		RedirectURI: p.RedirectURI,
+		State:       p.ClientState,
+		Challenge:   p.Challenge,
+		Scope:       p.Scope,
+	}
+
+	// The provider reports a refusal (or a failed sign-in) as an error query
+	// parameter instead of a code.
+	if e := q.Get("error"); e != "" {
+		log.Printf("oidc: provider returned error %q: %s", e, q.Get("error_description"))
+		redirectAuthError(w, r, ap, "access_denied")
+		return
+	}
+	if q.Get("code") == "" {
+		redirectAuthError(w, r, ap, "invalid_request")
+		return
+	}
+	// A state is one-time. Without this a callback URL that leaked into a log or
+	// history could be replayed for another local code.
+	if !s.signer.Redeem(p) {
+		renderErrorPage(w, http.StatusBadRequest, "This sign-in has already been completed.")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	id, err := s.oidc.Exchange(ctx, q.Get("code"), p.Verifier, p.Nonce)
+	if err != nil {
+		// A failed exchange is the server's problem (provider down, clock skew,
+		// bad client secret), not a denial by the person signing in.
+		log.Printf("oidc: exchange: %v", err)
+		redirectAuthError(w, r, ap, "server_error")
+		return
+	}
+	if !s.oidc.Allowed(id) {
+		log.Printf("oidc: refused sign-in for subject %q (email %q)", id.Subject, id.Email)
+		redirectAuthError(w, r, ap, "access_denied")
+		return
+	}
+	log.Printf("oidc: %s signed in", displayIdentity(id))
+
+	code := s.signer.Mint(oauth.Payload{
+		Kind:        oauth.KindCode,
+		ClientID:    ap.ClientID,
+		RedirectURI: ap.RedirectURI,
+		Challenge:   ap.Challenge,
+		Scope:       scopeYNAB,
+	}, oauth.CodeTTL)
+	redirectWithCode(w, r, ap, code)
+}
+
+// displayIdentity names a verified identity for a log line without echoing an
+// empty string when the provider sent no email claim.
+func displayIdentity(id oidc.Identity) string {
+	if id.Email != "" {
+		return id.Email
+	}
+	return "subject " + id.Subject
 }
 
 // checkCredentials compares both fields in constant time. They are hashed

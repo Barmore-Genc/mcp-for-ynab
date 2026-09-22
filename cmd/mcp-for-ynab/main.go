@@ -31,6 +31,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("configuration: %v", err)
 	}
+	for _, w := range cfg.Warnings {
+		log.Printf("warning: %s", w)
+	}
 	api, err := ynab.NewAPI(cfg.YNABToken)
 	if err != nil {
 		log.Fatalf("YNAB client: %v", err)
@@ -66,7 +69,11 @@ func main() {
 	if cfg.ReadOnly {
 		mode = "read only"
 	}
-	log.Printf("mcp-for-ynab %s listening on %s, serving %s/mcp (%s)", version, cfg.Addr, cfg.Origin, mode)
+	signin := "password"
+	if cfg.OIDC != nil {
+		signin = "OIDC via " + cfg.OIDC.Issuer
+	}
+	log.Printf("mcp-for-ynab %s listening on %s, serving %s/mcp (%s, sign-in: %s)", version, cfg.Addr, cfg.Origin, mode, signin)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("http server: %v", err)
 	}
