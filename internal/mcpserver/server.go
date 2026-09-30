@@ -50,7 +50,7 @@ func New(api *ynab.API, signer *oauth.Signer, origin, version string, readOnly b
 // OAuth client where to go and authenticate.
 func (s *Server) Handler() http.Handler {
 	srv := s.build()
-	h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+	h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{SessionTimeout: time.Hour})
 	return sdkauth.RequireBearerToken(s.verify, &sdkauth.RequireBearerTokenOptions{
 		ResourceMetadataURL: s.origin + "/.well-known/oauth-protected-resource",
 	})(h)
