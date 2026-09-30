@@ -78,6 +78,35 @@ func TestRedeemIsOneShot(t *testing.T) {
 	}
 }
 
+func TestMintKeepsCallerChosenID(t *testing.T) {
+	s := NewSigner("secret")
+	p, err := s.Verify(s.Mint(Payload{Kind: KindOIDC, ID: "flow-1"}, time.Minute), KindOIDC)
+	if err != nil || p.ID != "flow-1" {
+		t.Fatalf("id not kept: %+v %v", p, err)
+	}
+}
+
+func TestDeriveIsKeyedAndSeparated(t *testing.T) {
+	s := NewSigner("secret")
+	a := s.Derive("oidc-verifier", "flow-1")
+	if a != s.Derive("oidc-verifier", "flow-1") {
+		t.Fatal("derivation is not deterministic")
+	}
+	for _, other := range []string{
+		s.Derive("oidc-nonce", "flow-1"),
+		s.Derive("oidc-verifier", "flow-2"),
+		NewSigner("other").Derive("oidc-verifier", "flow-1"),
+	} {
+		if other == a {
+			t.Fatal("derived values collide across purpose, id or key")
+		}
+	}
+	// 43 characters is the shortest PKCE verifier RFC 7636 allows.
+	if len(a) != 43 {
+		t.Fatalf("derived value has length %d", len(a))
+	}
+}
+
 func TestVerifyS256(t *testing.T) {
 	verifier := "a-verifier-of-reasonable-length-0123456789"
 	sum := sha256.Sum256([]byte(verifier))

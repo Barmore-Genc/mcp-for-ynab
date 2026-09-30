@@ -4,16 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/Barmore-Genc/mcp-for-ynab/internal/oauth"
-	"github.com/Barmore-Genc/mcp-for-ynab/internal/oidc"
 )
 
 // scopeYNAB is the only scope. There is one user and one YNAB token behind this
@@ -30,10 +28,23 @@ func (s *Server) registerOAuthRoutes() {
 	s.mux.HandleFunc("/.well-known/oauth-authorization-server", s.handleAuthServerMetadata)
 	s.mux.HandleFunc("/.well-known/oauth-authorization-server/mcp", s.handleAuthServerMetadata)
 
-	s.mux.HandleFunc("POST /register", s.handleRegister)
+	// The consent form is the one endpoint a browser posts to with the
+	// operator's authority, so it refuses submissions made by other sites.
+	cop := http.NewCrossOriginProtection()
+	if u, err := url.Parse(s.cfg.Origin); err == nil && u.Host != "" {
+		if err := cop.AddTrustedOrigin(u.Scheme + "://" + u.Host); err != nil {
+			log.Printf("cross-origin protection: %v", err)
+		}
+	}
+	cop.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		renderErrorPage(w, http.StatusForbidden,
+			"This sign-in form was submitted from another website. Start again from your agent.")
+	}))
+
+	s.mux.Handle("POST /register", http.MaxBytesHandler(http.HandlerFunc(s.handleRegister), maxBodyBytes))
 	s.mux.HandleFunc("GET /authorize", s.handleAuthorize)
-	s.mux.HandleFunc("POST /authorize", s.handleAuthorizeSubmit)
-	s.mux.HandleFunc("POST /token", s.handleToken)
+	s.mux.Handle("POST /authorize", http.MaxBytesHandler(cop.Handler(http.HandlerFunc(s.handleAuthorizeSubmit)), maxBodyBytes))
+	s.mux.Handle("POST /token", http.MaxBytesHandler(http.HandlerFunc(s.handleToken), maxBodyBytes))
 	// The callback is where an OIDC provider returns the browser. It exists
 	// whether or not a provider is configured so a stale bookmark gets an
 	// explanation rather than a 404.
@@ -82,7 +93,7 @@ type registrationRequest struct {
 // carrying the registration itself, so registering stores nothing.
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req registrationRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "malformed registration body")
 		return
 	}
@@ -104,6 +115,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			"only token_endpoint_auth_method=none is supported")
 		return
 	}
+	req.ClientName = cleanClientName(req.ClientName)
 	id := s.signer.Mint(oauth.Payload{
 		Kind:         oauth.KindClient,
 		ClientName:   req.ClientName,
@@ -132,24 +144,27 @@ type authorizeParams struct {
 	Scope       string
 }
 
-// validateAuthorize checks an authorize request. A bad client_id or
-// redirect_uri returns redirectOK=false and must render an error page: sending
-// the error to an unvalidated redirect_uri is the open redirect the exact-match
-// check exists to prevent. Anything else may travel back to the client.
-func (s *Server) validateAuthorize(v url.Values) (p authorizeParams, redirectOK bool, errMsg string) {
+// validateAuthorize checks an authorize request. Every failure is shown as an
+// error page rather than sent to the redirect_uri: anyone can register a client
+// with any https redirect, so redirecting on a malformed request would make
+// this server an open redirect. The client only hears back once a person has
+// acted on the consent page.
+func (s *Server) validateAuthorize(v url.Values) (p authorizeParams, errMsg string) {
 	client, err := s.signer.Verify(v.Get("client_id"), oauth.KindClient)
 	if err != nil {
-		return p, false, "unknown client"
+		return p, "The app is not registered with this server."
 	}
 	redirectURI := v.Get("redirect_uri")
 	// Exact string match against the registered set: no normalization, prefix
 	// or wildcard.
 	if !exactContains(client.RedirectURIs, redirectURI) {
-		return p, false, "redirect_uri does not match a registered value"
+		return p, "The app asked to be sent somewhere it did not register (redirect_uri does not match)."
 	}
 	p = authorizeParams{
-		ClientID:    v.Get("client_id"),
-		ClientName:  client.ClientName,
+		ClientID: v.Get("client_id"),
+		// Clients registered before names were cleaned at registration still
+		// carry the raw name.
+		ClientName:  cleanClientName(client.ClientName),
 		RedirectURI: redirectURI,
 		State:       v.Get("state"),
 		Challenge:   v.Get("code_challenge"),
@@ -157,38 +172,38 @@ func (s *Server) validateAuthorize(v url.Values) (p authorizeParams, redirectOK 
 	}
 	switch {
 	case v.Get("response_type") != "code":
-		return p, true, "unsupported_response_type"
+		return p, "The app sent an invalid sign-in request (response_type must be code)."
 	case p.State == "":
-		return p, true, "state is required"
+		return p, "The app sent an invalid sign-in request (state is required)."
 	case p.Challenge == "":
-		return p, true, "code_challenge is required"
+		return p, "The app sent an invalid sign-in request (code_challenge is required)."
 	case v.Get("code_challenge_method") != "S256":
-		return p, true, "code_challenge_method must be S256"
+		return p, "The app sent an invalid sign-in request (code_challenge_method must be S256)."
 	}
-	return p, true, ""
+	return p, ""
 }
 
 func (s *Server) handleAuthorize(w http.ResponseWriter, r *http.Request) {
-	p, redirectOK, errMsg := s.validateAuthorize(r.URL.Query())
+	p, errMsg := s.validateAuthorize(r.URL.Query())
 	if errMsg != "" {
-		s.authorizeError(w, r, p, redirectOK, errMsg)
+		renderErrorPage(w, http.StatusBadRequest, errMsg)
 		return
 	}
-	s.renderLogin(w, p, "")
+	s.renderLogin(w, r, http.StatusOK, p, "")
 }
 
 // handleAuthorizeSubmit is the consent form. There is no session cookie and no
 // separate consent step: with a local password the operator types it here, and
 // with OIDC they click through to the provider; either way, submitting a form
-// that names the client asking is the consent.
+// that names where access is sent is the consent.
 func (s *Server) handleAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		renderErrorPage(w, http.StatusBadRequest, "malformed form")
+		renderErrorPage(w, http.StatusBadRequest, "The sign-in form could not be read.")
 		return
 	}
-	p, redirectOK, errMsg := s.validateAuthorize(r.PostForm)
+	p, errMsg := s.validateAuthorize(r.PostForm)
 	if errMsg != "" {
-		s.authorizeError(w, r, p, redirectOK, errMsg)
+		renderErrorPage(w, http.StatusBadRequest, errMsg)
 		return
 	}
 	if r.PostFormValue("decision") == "deny" {
@@ -202,47 +217,56 @@ func (s *Server) handleAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
 		s.startOIDC(w, r, p)
 		return
 	}
-	if !s.limiter.allow(clientIP(r)) {
-		renderErrorPage(w, http.StatusTooManyRequests, "too many sign-in attempts, wait a minute and try again")
+	caller := s.clientAddr(r)
+	if !s.limiter.allow(caller) {
+		renderErrorPage(w, http.StatusTooManyRequests, "Too many sign-in attempts. Wait a minute and try again.")
 		return
 	}
 	if !s.checkCredentials(r.PostFormValue("username"), r.PostFormValue("password")) {
 		// The form is re-rendered rather than redirected so the request keeps
 		// its parameters without them landing in browser history.
-		w.WriteHeader(http.StatusUnauthorized)
-		s.renderLogin(w, p, "Wrong username or password.")
+		s.renderLogin(w, r, http.StatusUnauthorized, p, "Wrong username or password.")
 		return
 	}
-	s.limiter.reset(clientIP(r))
-	code := s.signer.Mint(oauth.Payload{
+	s.limiter.reset(caller)
+	redirectWithCode(w, r, p, s.mintCode(p, time.Now()))
+}
+
+func (s *Server) mintCode(p authorizeParams, authTime time.Time) string {
+	return s.signer.Mint(oauth.Payload{
 		Kind:        oauth.KindCode,
 		ClientID:    p.ClientID,
 		RedirectURI: p.RedirectURI,
 		Challenge:   p.Challenge,
 		Scope:       scopeYNAB,
+		AuthTime:    authTime.Unix(),
 	}, oauth.CodeTTL)
-	redirectWithCode(w, r, p, code)
 }
 
 // startOIDC redirects the browser to the identity provider. Everything the
 // callback needs to resume the original request travels in the signed state,
-// so the server remembers nothing between the two halves of the flow. The nonce
-// ties the ID token back to this sign-in and the verifier is this server's PKCE
-// secret for the upstream exchange.
+// so the server remembers nothing between the two halves of the flow.
+//
+// The state is readable by the provider and anyone who sees the URL, so it
+// carries no secrets. The upstream nonce and PKCE verifier are derived from the
+// state's id with the signing key, and the state is bound to this browser by a
+// cookie holding a random value whose hash the state carries. Without that
+// binding, someone could start a sign-in themselves and send the provider link
+// to the owner, whose sign-in would then deliver a code to the attacker's app.
 func (s *Server) startOIDC(w http.ResponseWriter, r *http.Request, p authorizeParams) {
-	nonce := oauth.RandomID()
-	verifier := oauth.RandomVerifier()
+	id := oauth.RandomID()
+	binding := oauth.RandomSecret()
 	state := s.signer.Mint(oauth.Payload{
 		Kind:        oauth.KindOIDC,
+		ID:          id,
 		ClientID:    p.ClientID,
-		ClientName:  p.ClientName,
 		RedirectURI: p.RedirectURI,
 		Challenge:   p.Challenge,
 		Scope:       p.Scope,
 		ClientState: p.State,
-		Nonce:       nonce,
-		Verifier:    verifier,
+		Binding:     hashBinding(binding),
 	}, oauth.OIDCFlowTTL)
+	nonce, verifier := s.upstreamSecrets(id)
 
 	// Discovery is cached but the first sign-in fetches it, and the provider
 	// may be slow or down; bound it so the request cannot hang forever.
@@ -250,12 +274,44 @@ func (s *Server) startOIDC(w http.ResponseWriter, r *http.Request, p authorizePa
 	defer cancel()
 	authURL, err := s.oidc.AuthCodeURL(ctx, state, nonce, verifier)
 	if err != nil {
-		log.Printf("oidc: build authorization URL: %v", err)
+		log.Printf("oidc: build authorization URL: %q", err.Error())
 		renderErrorPage(w, http.StatusBadGateway,
 			"Could not reach the identity provider. Check the MCP_OIDC_ settings and that the provider is reachable.")
 		return
 	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     s.flowCookieName(id),
+		Value:    binding,
+		Path:     "/",
+		MaxAge:   int(oauth.OIDCFlowTTL / time.Second),
+		Secure:   s.secureCookies,
+		HttpOnly: true,
+		// Lax is what lets the cookie come back on the provider's top-level
+		// redirect to the callback, which is a cross-site navigation.
+		SameSite: http.SameSiteLaxMode,
+	})
 	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+func (s *Server) upstreamSecrets(stateID string) (nonce, verifier string) {
+	return s.signer.Derive("oidc-nonce", stateID), s.signer.Derive("oidc-verifier", stateID)
+}
+
+// flowCookieName is per sign-in so two connectors authorizing at once in the
+// same browser do not overwrite each other's binding. The __Host- prefix makes
+// the browser refuse the cookie unless it is Secure, host-only and at "/", so
+// no other site on a parent domain can plant one. It cannot be used on a
+// loopback http origin, where the cookie is not Secure.
+func (s *Server) flowCookieName(stateID string) string {
+	if s.secureCookies {
+		return "__Host-mcp-oidc-" + stateID
+	}
+	return "mcp-oidc-" + stateID
+}
+
+func hashBinding(v string) string {
+	sum := sha256.Sum256([]byte(v))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 // handleOIDCCallback completes the upstream sign-in. It verifies the signed
@@ -274,9 +330,26 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 			"This sign-in link is invalid or has expired. Start again from your agent.")
 		return
 	}
+	// Checked before anything can redirect to the client, so a sign-in started
+	// elsewhere never reaches the redirect_uri it names.
+	cookie, err := r.Cookie(s.flowCookieName(p.ID))
+	if err != nil || p.Binding == "" ||
+		subtle.ConstantTimeCompare([]byte(hashBinding(cookie.Value)), []byte(p.Binding)) != 1 {
+		renderErrorPage(w, http.StatusForbidden,
+			"This sign-in was started in a different browser, or the browser did not keep its cookie. "+
+				"Start again from your agent in this browser.")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookie.Name,
+		Path:     "/",
+		MaxAge:   -1,
+		Secure:   s.secureCookies,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
 	ap := authorizeParams{
 		ClientID:    p.ClientID,
-		ClientName:  p.ClientName,
 		RedirectURI: p.RedirectURI,
 		State:       p.ClientState,
 		Challenge:   p.Challenge,
@@ -286,7 +359,7 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	// The provider reports a refusal (or a failed sign-in) as an error query
 	// parameter instead of a code.
 	if e := q.Get("error"); e != "" {
-		log.Printf("oidc: provider returned error %q: %s", e, q.Get("error_description"))
+		log.Printf("oidc: provider returned error %q: %q", e, q.Get("error_description"))
 		redirectAuthError(w, r, ap, "access_denied")
 		return
 	}
@@ -303,38 +376,22 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	id, err := s.oidc.Exchange(ctx, q.Get("code"), p.Verifier, p.Nonce)
+	nonce, verifier := s.upstreamSecrets(p.ID)
+	id, err := s.oidc.Exchange(ctx, q.Get("code"), verifier, nonce)
 	if err != nil {
 		// A failed exchange is the server's problem (provider down, clock skew,
 		// bad client secret), not a denial by the person signing in.
-		log.Printf("oidc: exchange: %v", err)
+		log.Printf("oidc: exchange: %q", err.Error())
 		redirectAuthError(w, r, ap, "server_error")
 		return
 	}
 	if !s.oidc.Allowed(id) {
-		log.Printf("oidc: refused sign-in for subject %q (email %q)", id.Subject, id.Email)
+		log.Printf("oidc: refused sign-in for subject %q (email %q, verified %t)", id.Subject, id.Email, id.EmailVerified)
 		redirectAuthError(w, r, ap, "access_denied")
 		return
 	}
-	log.Printf("oidc: %s signed in", displayIdentity(id))
-
-	code := s.signer.Mint(oauth.Payload{
-		Kind:        oauth.KindCode,
-		ClientID:    ap.ClientID,
-		RedirectURI: ap.RedirectURI,
-		Challenge:   ap.Challenge,
-		Scope:       scopeYNAB,
-	}, oauth.CodeTTL)
-	redirectWithCode(w, r, ap, code)
-}
-
-// displayIdentity names a verified identity for a log line without echoing an
-// empty string when the provider sent no email claim.
-func displayIdentity(id oidc.Identity) string {
-	if id.Email != "" {
-		return id.Email
-	}
-	return "subject " + id.Subject
+	log.Printf("oidc: subject %q (email %q) signed in", id.Subject, id.Email)
+	redirectWithCode(w, r, ap, s.mintCode(ap, time.Now()))
 }
 
 // checkCredentials compares both fields in constant time. They are hashed
@@ -394,7 +451,7 @@ func (s *Server) tokenFromCode(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired code")
 		return
 	}
-	s.issueTokens(w, p.ClientID)
+	s.issueTokens(w, p.ClientID, p.AuthTime)
 }
 
 func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
@@ -407,33 +464,35 @@ func (s *Server) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "client mismatch")
 		return
 	}
-	s.issueTokens(w, p.ClientID)
+	// A refresh token from before sign-in times were recorded has no AuthTime
+	// and is refused, which costs its holder one sign-in.
+	if p.AuthTime == 0 || time.Since(time.Unix(p.AuthTime, 0)) >= oauth.MaxSessionAge {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "sign-in is too old, authorize again")
+		return
+	}
+	s.issueTokens(w, p.ClientID, p.AuthTime)
 }
 
 // issueTokens writes the RFC 6749 5.1 success body. Refresh tokens are not
 // rotated: rotation needs a record of which token is current, and this server
-// keeps no such record. Changing MCP_PASSWORD (or MCP_SIGNING_KEY) is what
-// revokes an outstanding one.
-func (s *Server) issueTokens(w http.ResponseWriter, clientID string) {
+// keeps no such record. Changing MCP_SIGNING_KEY revokes every outstanding one
+// at once; otherwise each stops working MaxSessionAge after the sign-in it
+// descends from.
+func (s *Server) issueTokens(w http.ResponseWriter, clientID string, authTime int64) {
+	remaining := time.Until(time.Unix(authTime, 0).Add(oauth.MaxSessionAge))
+	accessTTL := min(oauth.AccessTTL, remaining)
+	refreshTTL := min(oauth.RefreshTTL, remaining)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"access_token":  s.signer.Mint(oauth.Payload{Kind: oauth.KindAccess, ClientID: clientID, Scope: scopeYNAB}, oauth.AccessTTL),
-		"token_type":    "Bearer",
-		"expires_in":    int(oauth.AccessTTL / time.Second),
-		"refresh_token": s.signer.Mint(oauth.Payload{Kind: oauth.KindRefresh, ClientID: clientID, Scope: scopeYNAB}, oauth.RefreshTTL),
-		"scope":         scopeYNAB,
+		"access_token": s.signer.Mint(oauth.Payload{
+			Kind: oauth.KindAccess, ClientID: clientID, Scope: scopeYNAB,
+		}, accessTTL),
+		"token_type": "Bearer",
+		"expires_in": int(accessTTL / time.Second),
+		"refresh_token": s.signer.Mint(oauth.Payload{
+			Kind: oauth.KindRefresh, ClientID: clientID, Scope: scopeYNAB, AuthTime: authTime,
+		}, refreshTTL),
+		"scope": scopeYNAB,
 	})
-}
-
-func (s *Server) authorizeError(w http.ResponseWriter, r *http.Request, p authorizeParams, redirectOK bool, msg string) {
-	if !redirectOK {
-		renderErrorPage(w, http.StatusBadRequest, msg)
-		return
-	}
-	code := "invalid_request"
-	if msg == "unsupported_response_type" {
-		code = msg
-	}
-	redirectAuthError(w, r, p, code)
 }
 
 func redirectWithCode(w http.ResponseWriter, r *http.Request, p authorizeParams, code string) {
@@ -474,10 +533,11 @@ func writeOAuthError(w http.ResponseWriter, status int, code, desc string) {
 }
 
 // validRedirectURI accepts https URLs and loopback http URLs, which is what
-// native clients and Claude Code use for their callback.
+// native clients and Claude Code use for their callback. A fragment is refused
+// as RFC 6749 3.1.2 requires, and the host has to be a plain name or address.
 func validRedirectURI(raw string) bool {
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || u.Fragment != "" || u.User != nil || !cspHost.MatchString(u.Host) {
 		return false
 	}
 	switch u.Scheme {
@@ -514,19 +574,4 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
-}
-
-// clientIP identifies a caller for rate limiting. X-Forwarded-For is trusted
-// because this is meant to sit behind a reverse proxy; a caller that can forge
-// the header can already reach the login form directly, and the limiter is a
-// brute-force speed bump rather than an access control.
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.TrimSpace(strings.Split(fwd, ",")[0])
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

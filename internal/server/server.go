@@ -5,11 +5,17 @@ package server
 
 import (
 	"net/http"
+	"net/url"
+	"time"
 
 	"github.com/Barmore-Genc/mcp-for-ynab/internal/config"
 	"github.com/Barmore-Genc/mcp-for-ynab/internal/oauth"
 	"github.com/Barmore-Genc/mcp-for-ynab/internal/oidc"
 )
+
+// maxBodyBytes bounds the OAuth endpoints' request bodies. Their largest
+// legitimate input is a registration with a few redirect URIs.
+const maxBodyBytes = 64 << 10
 
 type Server struct {
 	cfg     config.Config
@@ -17,12 +23,18 @@ type Server struct {
 	oidc    *oidc.Provider
 	limiter *limiter
 	mux     *http.ServeMux
+	// secureCookies is false only for a loopback http origin, where a browser
+	// would drop a Secure cookie.
+	secureCookies bool
 }
 
 // New wires the routes. mcpHandler serves /mcp and is expected to do its own
 // bearer check against the same signer.
 func New(cfg config.Config, signer *oauth.Signer, mcpHandler http.Handler) *Server {
 	s := &Server{cfg: cfg, signer: signer, limiter: newLimiter(), mux: http.NewServeMux()}
+	if u, err := url.Parse(cfg.Origin); err == nil && u.Scheme == "https" {
+		s.secureCookies = true
+	}
 	if cfg.OIDC != nil {
 		s.oidc = oidc.New(*cfg.OIDC)
 	}
@@ -40,3 +52,17 @@ func New(cfg config.Config, signer *oauth.Signer, mcpHandler http.Handler) *Serv
 }
 
 func (s *Server) Handler() http.Handler { return s.mux }
+
+// HTTPServer returns an http.Server for addr with timeouts suited to this
+// handler. There is no WriteTimeout because /mcp holds server-sent event
+// streams open for as long as a session lasts.
+func (s *Server) HTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+}

@@ -4,8 +4,8 @@
 // static bearer token, so a server that only wants one password still has to
 // speak the whole ceremony.
 //
-// Every credential it issues — client id, authorization code, access token,
-// refresh token — is a self-describing string signed with one HMAC key, so the
+// Every credential it issues (client id, authorization code, access token,
+// refresh token) is a self-describing string signed with one HMAC key, so the
 // server keeps no database and no volume. The container can be restarted or
 // replaced without anyone re-authorizing, and the only state held in memory is
 // a set of already-redeemed authorization codes, which each expire a minute
@@ -30,10 +30,14 @@ import (
 // back and the immediate exchange. The access token is an hour so an agent
 // mid-conversation is not re-authorizing; the refresh token is 30 days so a
 // connector left alone over a holiday still comes back without a browser.
+// Refreshing slides that window forward, but never past MaxSessionAge after
+// the person signed in: refresh tokens cannot be revoked one by one, so a
+// leaked one must stop working on its own eventually.
 const (
-	CodeTTL    = time.Minute
-	AccessTTL  = time.Hour
-	RefreshTTL = 30 * 24 * time.Hour
+	CodeTTL       = time.Minute
+	AccessTTL     = time.Hour
+	RefreshTTL    = 30 * 24 * time.Hour
+	MaxSessionAge = 90 * 24 * time.Hour
 	// OIDCFlowTTL bounds the upstream leg of an OIDC sign-in. It is longer than
 	// CodeTTL because the person has to leave this server, sign in at their
 	// identity provider and come back, but it is still only a sign-in.
@@ -72,12 +76,14 @@ type Payload struct {
 	// through the OIDC round trip so it can be echoed back to the client's
 	// redirect_uri exactly as the local form echoes it.
 	ClientState string `json:"cs,omitempty"`
-	// Nonce and Verifier belong to the upstream OIDC leg: the nonce is checked
-	// against the ID token, and the verifier against the code the provider
-	// returns. Neither is ever given to the MCP client.
-	Nonce    string `json:"no,omitempty"`
-	Verifier string `json:"cv,omitempty"`
-	Expires  int64  `json:"e"`
+	// Binding is the SHA-256 of a random value held in a cookie of the browser
+	// that started an OIDC sign-in. The callback only completes in that
+	// browser, so a sign-in link started by someone else is useless to them.
+	Binding string `json:"b,omitempty"`
+	// AuthTime is when the person signed in. Codes and refresh tokens carry it
+	// forward so refreshing cannot extend a session past MaxSessionAge.
+	AuthTime int64 `json:"at,omitempty"`
+	Expires  int64 `json:"e"`
 }
 
 func (p Payload) ExpiresAt() time.Time { return time.Unix(p.Expires, 0) }
@@ -90,17 +96,22 @@ type Signer struct {
 	used map[string]int64
 }
 
-// NewSigner derives the signing key from secret. Two servers started with the
-// same secret mint interchangeable credentials, which is what lets a container
-// be replaced in place; changing the secret invalidates everything at once.
-func NewSigner(secret string) *Signer {
-	sum := sha256.Sum256([]byte("mcp-for-ynab/oauth\x00" + secret))
+// NewSigner derives the signing key from key, which must be random: client ids
+// are handed out to anyone, so a guessable key could be recovered offline from
+// one of them. Two servers started with the same key mint interchangeable
+// credentials, which is what lets a container be replaced in place; changing
+// the key invalidates everything at once.
+func NewSigner(key string) *Signer {
+	sum := sha256.Sum256([]byte("mcp-for-ynab/oauth\x00" + key))
 	return &Signer{key: sum[:], used: map[string]int64{}}
 }
 
-// Mint signs p, filling in its id and expiry, and returns the credential string.
+// Mint signs p, filling in its expiry and, unless the caller chose one, its id,
+// and returns the credential string.
 func (s *Signer) Mint(p Payload, ttl time.Duration) string {
-	p.ID = RandomID()
+	if p.ID == "" {
+		p.ID = RandomID()
+	}
 	p.Expires = time.Now().Add(ttl).Unix()
 	body, err := json.Marshal(p)
 	if err != nil {
@@ -141,6 +152,16 @@ func (s *Signer) Verify(cred, kind string) (Payload, error) {
 		return Payload{}, ErrInvalid
 	}
 	return p, nil
+}
+
+// Derive returns a secret bound to purpose and id that only a holder of the
+// signing key can compute. It lets a value that must stay secret, such as an
+// upstream PKCE verifier, be recomputed later instead of being carried in a
+// credential that is readable in transit.
+func (s *Signer) Derive(purpose, id string) string {
+	m := hmac.New(sha256.New, s.key)
+	m.Write([]byte("derive\x00" + purpose + "\x00" + id))
+	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
 }
 
 func (s *Signer) mac(b string) []byte {
@@ -187,9 +208,8 @@ func RandomID() string {
 	return base64.RawURLEncoding.EncodeToString(b[:])
 }
 
-// RandomVerifier returns a PKCE code verifier: 32 bytes of entropy as
-// base64url, which is the 43-character minimum RFC 7636 allows.
-func RandomVerifier() string {
+// RandomSecret returns 256 bits of entropy as base64url.
+func RandomSecret() string {
 	var b [32]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		panic(fmt.Sprintf("oauth: read random: %v", err))

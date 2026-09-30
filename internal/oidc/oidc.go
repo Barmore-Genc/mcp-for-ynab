@@ -12,6 +12,7 @@ package oidc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"slices"
@@ -39,12 +40,14 @@ type Config struct {
 	RedirectURI string
 	// Name is what the sign-in page calls the provider ("Pocket ID", "Google").
 	Name string
-	// AllowedEmails and AllowedSubjects restrict who may complete the flow. If
-	// both are empty any account the provider authenticates is accepted, which
-	// is only appropriate when the provider itself is trusted to contain the
-	// one person who should reach this budget.
+	// AllowedEmails and AllowedSubjects restrict who may complete the flow. An
+	// email only counts when the provider says it is verified.
 	AllowedEmails   []string
 	AllowedSubjects []string
+	// AllowAny accepts every account the provider authenticates. It has to be
+	// asked for explicitly, because on a public provider such as Google it
+	// would let anyone with an account in.
+	AllowAny bool
 }
 
 // Provider wraps one identity provider. Discovery is done lazily and cached:
@@ -127,8 +130,23 @@ func (p *Provider) AuthCodeURL(ctx context.Context, state, nonce, verifier strin
 
 // Identity is the part of the verified ID token the server cares about.
 type Identity struct {
-	Subject string
-	Email   string
+	Subject       string
+	Email         string
+	EmailVerified bool
+}
+
+// AuthorizationOrigin returns the scheme and host of the provider's
+// authorization endpoint. The sign-in page has to allow it as a form target,
+// because submitting the form ends in a redirect there.
+func (p *Provider) AuthorizationOrigin(ctx context.Context) (string, error) {
+	if err := p.ensure(ctx); err != nil {
+		return "", err
+	}
+	u, err := url.Parse(p.oauth2.Endpoint.AuthURL)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("authorization endpoint %q is not an absolute URL", p.oauth2.Endpoint.AuthURL)
+	}
+	return u.Scheme + "://" + u.Host, nil
 }
 
 // Exchange redeems an authorization code at the provider and verifies the ID
@@ -159,24 +177,44 @@ func (p *Provider) Exchange(ctx context.Context, code, verifier, nonce string) (
 		return Identity{}, fmt.Errorf("id_token nonce does not match")
 	}
 	var claims struct {
-		Email string `json:"email"`
+		Email         string          `json:"email"`
+		EmailVerified json.RawMessage `json:"email_verified"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		return Identity{}, fmt.Errorf("read id_token claims: %w", err)
 	}
-	return Identity{Subject: idToken.Subject, Email: claims.Email}, nil
+	return Identity{
+		Subject:       idToken.Subject,
+		Email:         claims.Email,
+		EmailVerified: isTrue(claims.EmailVerified),
+	}, nil
 }
 
-// Allowed reports whether the identity is permitted to finish signing in.
-// Both lists empty means any identity the provider vouched for is accepted.
+// isTrue reads email_verified, which some providers (Cognito among them) send
+// as the string "true" rather than a JSON boolean.
+func isTrue(raw json.RawMessage) bool {
+	var b bool
+	if json.Unmarshal(raw, &b) == nil {
+		return b
+	}
+	var s string
+	return json.Unmarshal(raw, &s) == nil && strings.EqualFold(s, "true")
+}
+
+// Allowed reports whether the identity is permitted to finish signing in. An
+// unverified email is ignored: many providers let a user put any address in
+// their profile, and matching on it would let them claim someone else's.
 func (p *Provider) Allowed(id Identity) bool {
-	if len(p.cfg.AllowedEmails) == 0 && len(p.cfg.AllowedSubjects) == 0 {
+	if p.cfg.AllowAny {
 		return true
 	}
 	for _, want := range p.cfg.AllowedSubjects {
 		if want == id.Subject {
 			return true
 		}
+	}
+	if !id.EmailVerified || id.Email == "" {
+		return false
 	}
 	for _, want := range p.cfg.AllowedEmails {
 		if strings.EqualFold(strings.TrimSpace(want), id.Email) {
