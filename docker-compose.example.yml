@@ -1,0 +1,23 @@
+services:
+  mcp-for-ynab:
+    image: ghcr.io/barmore-genc/mcp-for-ynab:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      YNAB_ACCESS_TOKEN: ${YNAB_ACCESS_TOKEN}
+      MCP_ORIGIN: https://ynab.example.com
+      # Generate once with: openssl rand -base64 32
+      MCP_SIGNING_KEY: ${MCP_SIGNING_KEY}
+      MCP_USERNAME: you
+      MCP_PASSWORD: ${MCP_PASSWORD}
+      # The reverse proxy's address, so sign-in attempts are counted per
+      # visitor instead of all as the proxy.
+      # MCP_TRUSTED_PROXIES: 172.16.0.0/12
+      # Sign in through an OpenID Connect provider instead of a password.
+      # Remove MCP_USERNAME and MCP_PASSWORD when using it.
+      # MCP_OIDC_ISSUER: https://id.example.com
+      # MCP_OIDC_CLIENT_ID: mcp-for-ynab
+      # MCP_OIDC_PROVIDER_NAME: Pocket ID
+      # MCP_OIDC_ALLOWED_EMAILS: you@example.com
+      # MCP_READ_ONLY: "true"

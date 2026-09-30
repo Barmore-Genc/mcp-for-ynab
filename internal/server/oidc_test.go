@@ -35,18 +35,22 @@ type fakeIDP struct {
 	kid     string
 	subject string
 	email   string
+	// emailVerified is sent as the email_verified claim as is, so a test can
+	// send false or the string form some providers use.
+	emailVerified any
 
 	mu    sync.Mutex
 	codes map[string]authRequest
 }
 
 type authRequest struct {
-	Nonce       string
-	Challenge   string
-	RedirectURI string
-	ClientID    string
-	Subject     string
-	Email       string
+	Nonce         string
+	Challenge     string
+	RedirectURI   string
+	ClientID      string
+	Subject       string
+	Email         string
+	EmailVerified any
 }
 
 func newFakeIDP(t *testing.T) *fakeIDP {
@@ -55,7 +59,7 @@ func newFakeIDP(t *testing.T) *fakeIDP {
 	if err != nil {
 		t.Fatalf("rsa: %v", err)
 	}
-	f := &fakeIDP{key: key, kid: "test-key", subject: idpSubject, email: idpEmail, codes: map[string]authRequest{}}
+	f := &fakeIDP{key: key, kid: "test-key", subject: idpSubject, email: idpEmail, emailVerified: true, codes: map[string]authRequest{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", f.discovery)
 	mux.HandleFunc("/jwks", f.jwks)
@@ -101,12 +105,13 @@ func (f *fakeIDP) authorize(w http.ResponseWriter, r *http.Request) {
 	code := oauth.RandomID()
 	f.mu.Lock()
 	f.codes[code] = authRequest{
-		Nonce:       q.Get("nonce"),
-		Challenge:   q.Get("code_challenge"),
-		RedirectURI: redirect,
-		ClientID:    q.Get("client_id"),
-		Subject:     f.subject,
-		Email:       f.email,
+		Nonce:         q.Get("nonce"),
+		Challenge:     q.Get("code_challenge"),
+		RedirectURI:   redirect,
+		ClientID:      q.Get("client_id"),
+		Subject:       f.subject,
+		Email:         f.email,
+		EmailVerified: f.emailVerified,
 	}
 	f.mu.Unlock()
 
@@ -159,7 +164,7 @@ func (f *fakeIDP) idToken(req authRequest) string {
 		"iat":            time.Now().Unix(),
 		"nonce":          req.Nonce,
 		"email":          req.Email,
-		"email_verified": true,
+		"email_verified": req.EmailVerified,
 	})
 	signer, err := jose.NewSigner(
 		jose.SigningKey{Algorithm: jose.RS256, Key: jose.JSONWebKey{Key: f.key, KeyID: f.kid}},
@@ -183,17 +188,18 @@ func newOIDCTestServer(t *testing.T, issuer string, allowedEmails ...string) *ht
 	t.Helper()
 	cfg := config.Config{
 		YNABToken:  "ynab-token",
-		Origin:     "https://ynab.example",
-		SigningKey: "signing-secret",
+		Origin:     "https://mcp.example",
+		SigningKey: testSigningKey,
 		OIDC: &oidc.Config{
 			Issuer:        issuer,
 			ClientID:      "mcp-for-ynab",
 			RedirectURI:   "https://ynab.example/oidc/callback",
 			Name:          "Pocket ID",
 			AllowedEmails: allowedEmails,
+			AllowAny:      len(allowedEmails) == 0,
 		},
 	}
-	srv := New(cfg, oauth.NewSigner("signing-secret"), http.NotFoundHandler())
+	srv := New(cfg, oauth.NewSigner(testSigningKey), http.NotFoundHandler())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts
@@ -206,6 +212,14 @@ func signInThroughProvider(t *testing.T, ts *httptest.Server, idp *fakeIDP, clie
 	t.Helper()
 	form := authorizeForm(clientID)
 	form.Set("decision", "allow")
+	authURL, cookies := startAtProvider(t, ts, idp, form)
+	return returnFromProvider(t, ts, authURL, cookies)
+}
+
+// startAtProvider submits the consent form and returns the provider URL the
+// browser is sent to, with the cookies the server set on the way.
+func startAtProvider(t *testing.T, ts *httptest.Server, idp *fakeIDP, form url.Values) (*url.URL, []*http.Cookie) {
+	t.Helper()
 	resp, err := noRedirect().PostForm(ts.URL+"/authorize", form)
 	if err != nil {
 		t.Fatalf("authorize: %v", err)
@@ -226,10 +240,15 @@ func signInThroughProvider(t *testing.T, ts *httptest.Server, idp *fakeIDP, clie
 	if q.Get("state") == "" || q.Get("nonce") == "" || q.Get("code_challenge") == "" {
 		t.Fatalf("provider request missing state, nonce or PKCE: %v", q)
 	}
+	return authURL, resp.Cookies()
+}
 
-	// The provider authenticates the person and sends the browser back to the
-	// configured callback. The test server's real address stands in for the
-	// public MCP_ORIGIN, so re-point the redirect without touching the query.
+// returnFromProvider lets the provider authenticate the person and follows its
+// redirect to the callback, presenting cookies as the browser would. The test
+// server's real address stands in for the public MCP_ORIGIN, so the redirect is
+// re-pointed without touching the query.
+func returnFromProvider(t *testing.T, ts *httptest.Server, authURL *url.URL, cookies []*http.Cookie) *http.Response {
+	t.Helper()
 	idpResp, err := noRedirect().Get(authURL.String())
 	if err != nil {
 		t.Fatalf("provider authorize: %v", err)
@@ -248,10 +267,15 @@ func signInThroughProvider(t *testing.T, ts *httptest.Server, idp *fakeIDP, clie
 		t.Fatalf("provider redirected to %s, not the callback", cbURL.Path)
 	}
 
-	cbResp, err := noRedirect().Get(cbURL.String())
+	req, _ := http.NewRequest(http.MethodGet, cbURL.String(), nil)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	cbResp, err := noRedirect().Do(req)
 	if err != nil {
 		t.Fatalf("callback: %v", err)
 	}
+	t.Cleanup(func() { cbResp.Body.Close() })
 	return cbResp
 }
 
@@ -269,7 +293,7 @@ func TestOIDCSignInIssuesWorkingTokens(t *testing.T) {
 	if access == "" {
 		t.Fatalf("token response missing credentials: %v", out)
 	}
-	if _, err := oauth.NewSigner("signing-secret").Verify(access, oauth.KindAccess); err != nil {
+	if _, err := oauth.NewSigner(testSigningKey).Verify(access, oauth.KindAccess); err != nil {
 		t.Fatalf("issued access token does not verify: %v", err)
 	}
 }

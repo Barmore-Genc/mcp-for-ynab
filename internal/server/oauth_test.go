@@ -20,17 +20,29 @@ const (
 	testPass     = "correct-horse-battery"
 	testRedirect = "http://127.0.0.1:33418/callback"
 	testVerifier = "verifier-0123456789-0123456789-0123456789"
+	// testSigningKey is the base64 of 32 bytes, as `openssl rand -base64 32`
+	// prints.
+	testSigningKey = "q7vd0l0ZlEo6Cz3WwLDqk0bE3J0cH3f0Qn6m2c0bXkA="
 )
+
+func testConfig() config.Config {
+	return config.Config{
+		YNABToken:  "ynab-token",
+		Username:   testUser,
+		Password:   testPass,
+		Origin:     "https://mcp.example",
+		SigningKey: testSigningKey,
+	}
+}
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	cfg := config.Config{
-		YNABToken: "ynab-token",
-		Username:  testUser,
-		Password:  testPass,
-		Origin:    "https://ynab.example",
-	}
-	srv := New(cfg, oauth.NewSigner("signing-secret"), http.NotFoundHandler())
+	return serve(t, testConfig())
+}
+
+func serve(t *testing.T, cfg config.Config) *httptest.Server {
+	t.Helper()
+	srv := New(cfg, oauth.NewSigner(cfg.SigningKey), http.NotFoundHandler())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts
@@ -156,7 +168,7 @@ func TestFullAuthorizationCodeFlow(t *testing.T) {
 	if access == "" || refresh == "" {
 		t.Fatalf("token response missing credentials: %v", out)
 	}
-	signer := oauth.NewSigner("signing-secret")
+	signer := oauth.NewSigner(testSigningKey)
 	if _, err := signer.Verify(access, oauth.KindAccess); err != nil {
 		t.Fatalf("issued access token does not verify: %v", err)
 	}
@@ -291,9 +303,8 @@ func TestAuthorizeRequiresS256(t *testing.T) {
 		t.Fatalf("authorize: %v", err)
 	}
 	defer resp.Body.Close()
-	loc := resp.Header.Get("Location")
-	if !strings.Contains(loc, "error=invalid_request") {
-		t.Fatalf("plain PKCE was not refused, redirected to %q (status %d)", loc, resp.StatusCode)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("plain PKCE was not refused, got %d (Location: %q)", resp.StatusCode, resp.Header.Get("Location"))
 	}
 }
 

@@ -32,30 +32,43 @@ its id. Set `MCP_READ_ONLY=true` to drop the six write tools entirely.
 ## Running it
 
 ```sh
-docker run -p 8080:8080 \
+docker run -p 127.0.0.1:8080:8080 \
   -e YNAB_ACCESS_TOKEN=... \
   -e MCP_USERNAME=you \
   -e MCP_PASSWORD='a long password' \
+  -e MCP_SIGNING_KEY="$(openssl rand -base64 32)" \
   -e MCP_ORIGIN=https://ynab.example.com \
   ghcr.io/barmore-genc/mcp-for-ynab:latest
 ```
+
+Generate `MCP_SIGNING_KEY` once and keep it: every token the server issues is
+signed with it, so a new key signs every connected agent out.
+
+With Docker Compose, copy `docker-compose.example.yml`, fill in the values and
+run `docker compose up -d`.
 
 Get the YNAB token from **Account Settings → Developer Settings → New Access
 Token** in the YNAB web app. It is a personal access token, so this server sees
 exactly the one YNAB account it belongs to.
 
 `MCP_ORIGIN` is the public URL the server is reached at, scheme included. It has
-to be right: the OAuth flow builds every URL it advertises from it. Put the
-container behind a reverse proxy that terminates TLS, or run it on a private
-network.
+to be right: the OAuth flow builds every URL it advertises from it. It must be
+`https://`, except for `localhost` or a loopback address while trying the server
+out on your own machine.
+
+The examples publish the port on `127.0.0.1` only. Put a reverse proxy that
+terminates TLS in front of it, and set `MCP_TRUSTED_PROXIES` to the proxy's
+address so the server counts sign-in attempts per visitor rather than all as the
+proxy. The server reads `X-Forwarded-For` only from the addresses listed there.
 
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `YNAB_ACCESS_TOKEN` | yes | YNAB personal access token |
 | `MCP_ORIGIN` | yes | Public base URL, e.g. `https://ynab.example.com` |
+| `MCP_SIGNING_KEY` | yes | Signs the OAuth credentials. At least 32 characters of random data, e.g. from `openssl rand -base64 32` |
 | `MCP_USERNAME` | password mode | What you type on the sign-in page |
 | `MCP_PASSWORD` | password mode | The password for it, at least 12 characters |
-| `MCP_SIGNING_KEY` | no¹ | Signs the OAuth credentials; derived from the password otherwise |
+| `MCP_TRUSTED_PROXIES` | no | Comma-separated addresses or CIDRs of reverse proxies whose `X-Forwarded-For` is used, e.g. `172.16.0.0/12` |
 | `MCP_ADDR` | no | Listen address, `:8080` by default |
 | `MCP_READ_ONLY` | no | `true` to offer only the read tools |
 | `MCP_OIDC_ISSUER` | OIDC mode | Provider base URL, e.g. `https://id.example.com` |
@@ -64,10 +77,11 @@ network.
 | `MCP_OIDC_PROVIDER_NAME` | no | Name shown on the sign-in button, e.g. `Pocket ID` |
 | `MCP_OIDC_SCOPES` | no | Scopes to request, `openid email profile` by default |
 | `MCP_OIDC_REDIRECT_URI` | no | Overrides the callback, `$MCP_ORIGIN/oidc/callback` by default |
-| `MCP_OIDC_ALLOWED_EMAILS` | no | Comma-separated addresses allowed to sign in |
-| `MCP_OIDC_ALLOWED_SUBJECTS` | no | Comma-separated provider subject ids allowed to sign in |
+| `MCP_OIDC_ALLOWED_EMAILS` | OIDC mode¹ | Comma-separated verified addresses allowed to sign in |
+| `MCP_OIDC_ALLOWED_SUBJECTS` | OIDC mode¹ | Comma-separated provider subject ids allowed to sign in |
+| `MCP_OIDC_ALLOW_ANY` | OIDC mode¹ | `true` to accept every account the provider authenticates |
 
-¹ Required in OIDC mode, where there is no password to derive it from.
+¹ OIDC mode needs at least one of these three.
 
 ## Connecting an agent to it
 
@@ -94,12 +108,11 @@ anything else that publishes a `.well-known/openid-configuration`. Nothing is
 tailored to a specific vendor: the server reads the provider's endpoints from
 discovery and is configured with an issuer and a client id.
 
-Set `MCP_OIDC_ISSUER` and `MCP_OIDC_CLIENT_ID` to turn it on, drop
-`MCP_USERNAME`/`MCP_PASSWORD`, and supply `MCP_SIGNING_KEY` (in OIDC mode there
-is no password for the token signing key to be derived from). When an issuer is
-set, sign-in goes through OIDC and a leftover `MCP_USERNAME`/`MCP_PASSWORD` is
-ignored; the server logs a warning saying so rather than pretending the password
-still works.
+Set `MCP_OIDC_ISSUER` and `MCP_OIDC_CLIENT_ID` to turn it on, say who may sign
+in (see [Who is allowed in](#who-is-allowed-in)), and drop
+`MCP_USERNAME`/`MCP_PASSWORD`. When an issuer is set, sign-in goes through OIDC
+and a leftover `MCP_USERNAME`/`MCP_PASSWORD` is ignored; the server logs a
+warning saying so rather than pretending the password still works.
 
 ### Pocket ID
 
@@ -114,23 +127,21 @@ still works.
 2. Start the container with the client details:
 
    ```sh
-   docker run -p 8080:8080 \
+   docker run -p 127.0.0.1:8080:8080 \
      -e YNAB_ACCESS_TOKEN=... \
      -e MCP_ORIGIN=https://ynab.example.com \
      -e MCP_OIDC_ISSUER=https://id.example.com \
      -e MCP_OIDC_CLIENT_ID=<client id> \
      -e MCP_OIDC_PROVIDER_NAME='Pocket ID' \
      -e MCP_OIDC_ALLOWED_EMAILS=you@example.com \
-     -e MCP_SIGNING_KEY=$(openssl rand -base64 32) \
+     -e MCP_SIGNING_KEY="$(openssl rand -base64 32)" \
      ghcr.io/barmore-genc/mcp-for-ynab:latest
    ```
 
    `MCP_OIDC_ISSUER` is Pocket ID's own URL, the one you open in a browser, not
    an internal container address. `MCP_OIDC_CLIENT_SECRET` is only needed if you
-   turned **Public client** off, and `MCP_OIDC_ALLOWED_EMAILS` is optional too:
-   leave it out to accept anyone who can sign in at Pocket ID. The required OIDC
-   variables are just `MCP_OIDC_ISSUER`, `MCP_OIDC_CLIENT_ID` and
-   `MCP_SIGNING_KEY`.
+   turned **Public client** off. To accept anyone who can sign in at Pocket ID,
+   replace `MCP_OIDC_ALLOWED_EMAILS` with `MCP_OIDC_ALLOW_ANY=true`.
 
 3. Connect the agent as usual. The sign-in page now shows a single **Continue
    with Pocket ID** button; after Pocket ID authenticates you, you land back on
@@ -154,18 +165,24 @@ at the provider. Request whatever scopes you need with `MCP_OIDC_SCOPES`; the
 
 ### Who is allowed in
 
-By default any account the provider authenticates may sign in, which is only
-safe when the provider is itself restricted to you. Set
-`MCP_OIDC_ALLOWED_EMAILS` (and/or `MCP_OIDC_ALLOWED_SUBJECTS`) to pin the server
-to specific identities. An email has to match exactly, case-insensitively; the
+Set `MCP_OIDC_ALLOWED_EMAILS` and/or `MCP_OIDC_ALLOWED_SUBJECTS` to pin the
+server to specific identities. An email has to match exactly, case-insensitively,
+and only counts when the provider marks it as verified (`email_verified`); the
 subject is the provider's stable user id. A sign-in that matches neither is sent
 back to the agent as `access_denied` and logged by the server.
+
+`MCP_OIDC_ALLOW_ANY=true` accepts every account the provider authenticates
+instead. Use it only when the provider itself contains nobody but you: with
+Google, for example, it would let in anyone with a Google account. The server
+refuses to start in OIDC mode unless one of these is set.
 
 ## How authentication works
 
 The container is its own OAuth 2.1 authorization server. It registers clients
 dynamically, requires PKCE with S256, and issues an access token good for an
-hour and a refresh token good for thirty days.
+hour and a refresh token good for thirty days. Each refresh extends that, up to
+90 days after you signed in; after that the agent sends you through the sign-in
+page again.
 
 None of that is stored. Every credential it issues is a signed string that
 carries its own contents, so the container keeps no database and no volume, and
@@ -173,11 +190,17 @@ restarting or replacing it does not disconnect anything. The only thing held in
 memory is the set of authorization codes already redeemed, which expire a minute
 after they are minted.
 
-Changing `MCP_PASSWORD` (or `MCP_SIGNING_KEY`) invalidates every outstanding
-token at once, which is how you revoke access. In OIDC mode the password does
-not exist, so `MCP_SIGNING_KEY` is the revocation switch; the signed state that
-carries an in-progress sign-in through the provider expires after ten minutes
-and can be used only once.
+Changing `MCP_SIGNING_KEY` invalidates every outstanding token at once, which is
+how you revoke access. Changing `MCP_PASSWORD` only affects future sign-ins.
+
+The sign-in page shows the address the agent will receive access at. Check it
+before you sign in: the app name shown below it is whatever the app registered
+itself as. Sign-in attempts are limited to 5 per minute per address and 20 per
+minute in total.
+
+With an identity provider, a sign-in has to finish in the browser that started
+it. The signed state that carries it through the provider expires after ten
+minutes and can be used only once.
 
 ## Development
 
