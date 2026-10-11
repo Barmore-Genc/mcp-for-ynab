@@ -203,7 +203,7 @@ func renderTransactions(rows []ynab.Txn, in searchTransactionsInput, window stri
 		fmt.Fprintf(&b, "%s | %10s | %s | %s | %s | %s%s%s | %s\n",
 			isoDate(t.Date), money(t.AmountText, t.Amount, cf),
 			orDash(t.PayeeName), orDash(t.CategoryName), t.AccountName,
-			t.Cleared, flags, memo, ynab.ShortID(t.ID))
+			t.Cleared, flags, memo, t.ID)
 	}
 	if len(rows) == 0 {
 		b.WriteString("Nothing matched. Widen since_date if you were looking further back.\n")
@@ -381,7 +381,7 @@ func (s *Server) listScheduledTransactions(ctx context.Context, _ *mcp.CallToolR
 		fmt.Fprintf(&b, "%s | %10s | %s | %s | %s | %s [%s]\n",
 			isoDate(t.DateNext), money(t.AmountFormatted, t.Amount, cf),
 			orDash(str(t.PayeeName)), orDash(str(t.CategoryName)), t.AccountName,
-			string(t.Frequency), ynab.ShortID(t.Id.String()))
+			string(t.Frequency), t.Id.String())
 		total += t.Amount
 		shown++
 	}

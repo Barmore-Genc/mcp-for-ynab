@@ -170,8 +170,14 @@ func fromHybrids(in []HybridTransaction) []Txn {
 		if t.Deleted {
 			continue
 		}
+		// YNAB has no endpoint that takes a subtransaction id, so a split's
+		// part carries its parent's id, which the other tools accept.
+		id := t.Id
+		if t.ParentTransactionId != nil {
+			id = *t.ParentTransactionId
+		}
 		out = append(out, Txn{
-			ID: t.Id, Date: t.Date, Amount: t.Amount, AmountText: t.AmountFormatted,
+			ID: id, Date: t.Date, Amount: t.Amount, AmountText: t.AmountFormatted,
 			PayeeName: strValue(t.PayeeName), CategoryName: strValue(t.CategoryName),
 			CategoryID: uuidValue(t.CategoryId), AccountName: t.AccountName, AccountID: t.AccountId.String(),
 			Cleared: string(t.Cleared), Approved: t.Approved, FlagColor: flag(t.FlagColor),

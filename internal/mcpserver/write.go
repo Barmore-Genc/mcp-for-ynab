@@ -317,7 +317,7 @@ func (s *Server) updateTransactions(ctx context.Context, _ *mcp.CallToolRequest,
 			return fail(fmt.Errorf("update %d changes nothing", i+1))
 		}
 		payload = append(payload, save)
-		fmt.Fprintf(&preview, "%s: %s\n", ynab.ShortID(u.TransactionID), strings.Join(changes, ", "))
+		fmt.Fprintf(&preview, "%s: %s\n", u.TransactionID, strings.Join(changes, ", "))
 	}
 
 	if in.DryRun {

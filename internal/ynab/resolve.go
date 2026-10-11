@@ -9,15 +9,10 @@ import (
 
 // Tools accept a name wherever YNAB wants a uuid, because an agent that has to
 // look up an id before every write spends two requests on every one it needs.
-// A reference is matched, in order, as a full uuid, as the short id the
-// renderer prints, as an exact name, and finally as a substring — so the
+// A reference is matched, in order, as a uuid, as an exact name, and finally
+// as a substring — so the
 // obvious thing works and the ambiguous thing fails loudly with the candidates
 // rather than silently picking one.
-
-// ShortIDLen is how much of a uuid the renderer prints and this resolver
-// accepts back. Eight hex characters is enough to be unique across a budget's
-// few thousand entities, and saves 28 characters on every line of every list.
-const ShortIDLen = 8
 
 // AmbiguousError is returned when a name matches more than one thing. Listing
 // the candidates is what makes it recoverable in one turn.
@@ -69,7 +64,7 @@ func resolve(kind, q string, in []Named) (Named, error) {
 		id := strings.ToLower(n.ID)
 		name := strings.ToLower(n.Name)
 		switch {
-		case id == lower || (len(lower) >= ShortIDLen && strings.HasPrefix(id, lower)):
+		case id == lower:
 			byID = append(byID, n)
 		case name == lower || strings.ToLower(n.label()) == lower:
 			exact = append(exact, n)
@@ -88,7 +83,7 @@ func resolve(kind, q string, in []Named) (Named, error) {
 		default:
 			labels := make([]string, 0, len(tier))
 			for _, n := range tier {
-				labels = append(labels, fmt.Sprintf("%s [%s]", n.label(), ShortID(n.ID)))
+				labels = append(labels, fmt.Sprintf("%s [%s]", n.label(), n.ID))
 			}
 			sort.Strings(labels)
 			if len(labels) > 8 {
@@ -98,14 +93,6 @@ func resolve(kind, q string, in []Named) (Named, error) {
 		}
 	}
 	return Named{}, &NotFoundError{Kind: kind, Query: q}
-}
-
-// ShortID truncates a uuid to what the renderer prints.
-func ShortID(id string) string {
-	if len(id) <= ShortIDLen {
-		return id
-	}
-	return id[:ShortIDLen]
 }
 
 func (a *API) ResolveAccount(ctx context.Context, plan, q string) (Named, error) {

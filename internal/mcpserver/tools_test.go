@@ -55,10 +55,19 @@ func fakeYNAB(t *testing.T) *httptest.Server {
 	})
 	mux.HandleFunc("/plans/last-used/transactions", func(w http.ResponseWriter, r *http.Request) {
 		write(w, map[string]any{"server_knowledge": 1, "transactions": []any{
-			txnJSON("t1", "2026-03-04", -42500, "Whole Foods", "Groceries", "cleared", true),
-			txnJSON("t2", "2026-03-05", -12000, "Whole Foods", "Groceries", "uncleared", false),
-			txnJSON("t3", "2026-03-06", -80000, "Landlord", "Rent", "cleared", true),
+			txnJSON(txn1ID, "2026-03-04", -42500, "Whole Foods", "Groceries", "cleared", true),
+			txnJSON("22222222-2222-4222-8222-222222222222", "2026-03-05", -12000, "Whole Foods", "Groceries", "uncleared", false),
+			txnJSON("33333333-3333-4333-8333-333333333333", "2026-03-06", -80000, "Landlord", "Rent", "cleared", true),
 		}})
+	})
+	mux.HandleFunc("/plans/last-used/transactions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("id") != txn1ID {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"id": "404.2", "name": "resource_not_found", "detail": "Resource not found"}})
+			return
+		}
+		write(w, map[string]any{"transaction": txnJSON(txn1ID, "2026-03-04", -42500, "Whole Foods", "Groceries", "cleared", true)})
 	})
 	mux.HandleFunc("/plans/last-used/payees", func(w http.ResponseWriter, r *http.Request) {
 		write(w, map[string]any{"server_knowledge": 1, "payees": []any{
@@ -78,6 +87,7 @@ func fakeYNAB(t *testing.T) *httptest.Server {
 const (
 	planID    = "11111111-1111-4111-8111-111111111111"
 	accountID = "aaaaaaaa-1111-4111-8111-111111111111"
+	txn1ID    = "12345678-9abc-4def-8123-456789abcdef"
 )
 
 func txnJSON(id, date string, amount int, payee, category, cleared string, approved bool) map[string]any {
@@ -220,6 +230,21 @@ func TestSearchTransactionsRendersLinesAndTotal(t *testing.T) {
 	}
 }
 
+// The id at the end of a search line has to be one the other transaction
+// tools accept.
+func TestSearchedIDWorksInGetTransaction(t *testing.T) {
+	cs := connect(t, false)
+	out := callText(t, cs, "ynab_search_transactions", map[string]any{"text": "whole foods", "sort": "date_asc"})
+	first := strings.Split(strings.Split(out, "\n")[1], " | ")
+	id := first[len(first)-1]
+	if id != txn1ID {
+		t.Fatalf("search printed %q, want the full id %q", id, txn1ID)
+	}
+	if got := callText(t, cs, "ynab_get_transaction", map[string]any{"transaction_id": id}); !strings.Contains(got, "Whole Foods") {
+		t.Fatalf("get_transaction did not accept the searched id: %s", got)
+	}
+}
+
 func TestSearchTransactionsGroupBy(t *testing.T) {
 	out := callText(t, connect(t, false), "ynab_search_transactions", map[string]any{"group_by": "category"})
 	if !strings.Contains(out, "by category") {
@@ -247,7 +272,7 @@ func TestDeleteRequiresConfirmation(t *testing.T) {
 	cs := connect(t, false)
 	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "ynab_delete_transaction",
-		Arguments: map[string]any{"transaction_id": "t1"},
+		Arguments: map[string]any{"transaction_id": txn1ID},
 	})
 	if err != nil {
 		t.Fatalf("call: %v", err)
