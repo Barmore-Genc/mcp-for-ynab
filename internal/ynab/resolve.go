@@ -124,13 +124,23 @@ func (a *API) ResolvePayee(ctx context.Context, plan, q string) (Named, error) {
 // hidden-category bucket, neither of which can be assigned to. Hidden groups
 // are kept, because a hidden category is still a real one someone may name.
 func (a *API) ResolveCategory(ctx context.Context, plan, q string) (Named, error) {
+	return a.resolveCategory(ctx, plan, q, false)
+}
+
+// ResolveTransactionCategory also searches the internal groups, because income
+// and starting balances are categorized as "Inflow: Ready to Assign".
+func (a *API) ResolveTransactionCategory(ctx context.Context, plan, q string) (Named, error) {
+	return a.resolveCategory(ctx, plan, q, true)
+}
+
+func (a *API) resolveCategory(ctx context.Context, plan, q string, internal bool) (Named, error) {
 	groups, err := a.CategoryGroups(ctx, plan)
 	if err != nil {
 		return Named{}, err
 	}
 	var in []Named
 	for _, g := range groups {
-		if g.Internal {
+		if g.Internal && !internal {
 			continue
 		}
 		for _, c := range g.Categories {
