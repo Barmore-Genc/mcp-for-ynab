@@ -18,13 +18,6 @@ func TestResolveByFullID(t *testing.T) {
 	}
 }
 
-func TestResolveByShortID(t *testing.T) {
-	got, err := resolve("account", "cccccccc", testAccounts)
-	if err != nil || got.Name != "Visa" {
-		t.Fatalf("got %+v, %v", got, err)
-	}
-}
-
 // An exact name wins over a longer name it is a prefix of, which is the case
 // that would otherwise be reported as ambiguous on every call.
 func TestExactNameBeatsPrefix(t *testing.T) {

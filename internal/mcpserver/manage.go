@@ -127,7 +127,7 @@ func (s *Server) buildScheduled(ctx context.Context, p string, in manageSchedule
 func describeScheduled(t *ynab.ScheduledTransactionDetail, cf *ynab.CurrencyFormat) string {
 	return fmt.Sprintf("%s %s from %s, %s, next on %s [%s]",
 		money(t.AmountFormatted, t.Amount, cf), orDash(str(t.PayeeName)), t.AccountName,
-		string(t.Frequency), isoDate(t.DateNext), ynab.ShortID(t.Id.String()))
+		string(t.Frequency), isoDate(t.DateNext), t.Id.String())
 }
 
 // --- manage_category ---
@@ -156,7 +156,7 @@ func (s *Server) manageCategory(ctx context.Context, _ *mcp.CallToolRequest, in 
 		if err != nil {
 			return fail(err)
 		}
-		return text(fmt.Sprintf("Created the category group %q [%s].", g.Name, ynab.ShortID(g.Id.String()))), nil, nil
+		return text(fmt.Sprintf("Created the category group %q [%s].", g.Name, g.Id.String())), nil, nil
 
 	case "update_group":
 		if in.Group == "" || in.Name == "" {
@@ -194,7 +194,7 @@ func (s *Server) manageCategory(ctx context.Context, _ *mcp.CallToolRequest, in 
 		if err != nil {
 			return fail(err)
 		}
-		return text(fmt.Sprintf("Created %q in %q [%s].", c.Name, group.Name, ynab.ShortID(c.Id.String()))), nil, nil
+		return text(fmt.Sprintf("Created %q in %q [%s].", c.Name, group.Name, c.Id.String())), nil, nil
 
 	case "update_category":
 		if in.Category == "" {

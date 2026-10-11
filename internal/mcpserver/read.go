@@ -198,7 +198,7 @@ func (s *Server) getBudgetMonth(ctx context.Context, _ *mcp.CallToolRequest, in 
 			money(c.BudgetedFormatted, c.Budgeted, cf),
 			money(c.ActivityFormatted, c.Activity, cf),
 			money(c.BalanceFormatted, c.Balance, cf),
-			ynab.ShortID(c.Id.String()))
+			c.Id.String())
 		if in.IncludeGoals && c.GoalType != nil {
 			fmt.Fprintf(&b, "\n      goal %s target %s", string(*c.GoalType), money(c.GoalTargetFormatted, deref(c.GoalTarget), cf))
 			if c.GoalTargetMonth != nil {
@@ -272,7 +272,7 @@ func (s *Server) listAccounts(ctx context.Context, _ *mcp.CallToolRequest, in li
 			money(a.BalanceFormatted, a.Balance, cf),
 			money(a.ClearedBalanceFormatted, a.ClearedBalance, cf),
 			money(a.UnclearedBalanceFormatted, a.UnclearedBalance, cf),
-			flags, ynab.ShortID(a.Id.String()))
+			flags, a.Id.String())
 		shown++
 		if a.Closed {
 			continue
@@ -334,7 +334,7 @@ func (s *Server) listPayees(ctx context.Context, _ *mcp.CallToolRequest, in list
 		if i >= limit {
 			break
 		}
-		fmt.Fprintf(&b, "%s [%s]\n", v.Name, ynab.ShortID(v.Id.String()))
+		fmt.Fprintf(&b, "%s [%s]\n", v.Name, v.Id.String())
 	}
 	if len(matched) == 0 {
 		return text(fmt.Sprintf("No payees match %q.", in.Query)), nil, nil
