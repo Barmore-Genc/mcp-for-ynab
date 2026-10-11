@@ -77,7 +77,7 @@ func (s *Server) searchTransactions(ctx context.Context, _ *mcp.CallToolRequest,
 		}
 		scope.AccountID = ref.ID
 	case in.Category != "" && !uncategorized:
-		ref, err := s.api.ResolveCategory(ctx, p, in.Category)
+		ref, err := s.api.ResolveTransactionCategory(ctx, p, in.Category)
 		if err != nil {
 			return fail(err)
 		}
@@ -119,7 +119,7 @@ func (s *Server) searchTransactions(ctx context.Context, _ *mcp.CallToolRequest,
 func (s *Server) filter(ctx context.Context, p string, rows []ynab.Txn, in searchTransactionsInput, uncategorized bool, scope ynab.TransactionScope) ([]ynab.Txn, error) {
 	var categoryID, payeeID, accountID string
 	if in.Category != "" && !uncategorized && scope.CategoryID == "" {
-		ref, err := s.api.ResolveCategory(ctx, p, in.Category)
+		ref, err := s.api.ResolveTransactionCategory(ctx, p, in.Category)
 		if err != nil {
 			return nil, err
 		}

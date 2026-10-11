@@ -166,7 +166,7 @@ func (s *Server) createTransactions(ctx context.Context, _ *mcp.CallToolRequest,
 			nt.Subtransactions = &subs
 			categoryLabel = "split: " + strings.Join(labels, ", ")
 		} else if t.Category != "" {
-			ref, err := s.api.ResolveCategory(ctx, p, t.Category)
+			ref, err := s.api.ResolveTransactionCategory(ctx, p, t.Category)
 			if err != nil {
 				return fail(fmt.Errorf("transaction %d: %w", i+1, err))
 			}
@@ -209,7 +209,7 @@ func (s *Server) resolveSplits(ctx context.Context, p string, t newTransaction) 
 		sub := ynab.SaveSubTransaction{Amount: toMilli(sp.Amount)}
 		label := "—"
 		if sp.Category != "" {
-			ref, err := s.api.ResolveCategory(ctx, p, sp.Category)
+			ref, err := s.api.ResolveTransactionCategory(ctx, p, sp.Category)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -281,7 +281,7 @@ func (s *Server) updateTransactions(ctx context.Context, _ *mcp.CallToolRequest,
 			changes = append(changes, "date → "+d.Format("2006-01-02"))
 		}
 		if u.Category != "" {
-			ref, err := s.api.ResolveCategory(ctx, p, u.Category)
+			ref, err := s.api.ResolveTransactionCategory(ctx, p, u.Category)
 			if err != nil {
 				return fail(fmt.Errorf("update %d: %w", i+1, err))
 			}

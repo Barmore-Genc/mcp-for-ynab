@@ -108,7 +108,7 @@ func (s *Server) buildScheduled(ctx context.Context, p string, in manageSchedule
 		save.FlagColor = ptr(ynab.TransactionFlagColor(in.FlagColor))
 	}
 	if in.Category != "" {
-		ref, err := s.api.ResolveCategory(ctx, p, in.Category)
+		ref, err := s.api.ResolveTransactionCategory(ctx, p, in.Category)
 		if err != nil {
 			return save, err
 		}

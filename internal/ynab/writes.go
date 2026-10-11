@@ -1,7 +1,10 @@
 package ynab
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 
 	openapi_types "github.com/oapi-codegen/runtime/types"
@@ -23,7 +26,11 @@ func (a *API) CreateTransactions(ctx context.Context, plan string, txns []NewTra
 
 func (a *API) UpdateTransactions(ctx context.Context, plan string, txns []SaveTransactionWithIdOrImportId) (*SaveTransactionsResponse, error) {
 	res, err := call[SaveTransactionsResponse](ctx, a, func(ctx context.Context) (*http.Response, error) {
-		return a.c.UpdateTransactions(ctx, plan, PatchTransactionsWrapper{Transactions: txns})
+		body, err := withoutNulls(PatchTransactionsWrapper{Transactions: txns})
+		if err != nil {
+			return nil, err
+		}
+		return a.c.UpdateTransactionsWithBody(ctx, plan, "application/json", body)
 	})
 	if err != nil {
 		return nil, err
@@ -102,7 +109,11 @@ func (a *API) CreateCategory(ctx context.Context, plan string, c NewCategory) (*
 
 func (a *API) UpdateCategory(ctx context.Context, plan, id string, c ExistingCategory) (*Category, error) {
 	res, err := call[SaveCategoryResponse](ctx, a, func(ctx context.Context) (*http.Response, error) {
-		return a.c.UpdateCategory(ctx, plan, id, PatchCategoryWrapper{Category: c})
+		body, err := withoutNulls(PatchCategoryWrapper{Category: c})
+		if err != nil {
+			return nil, err
+		}
+		return a.c.UpdateCategoryWithBody(ctx, plan, id, "application/json", body)
 	})
 	if err != nil {
 		return nil, err
@@ -131,4 +142,44 @@ func (a *API) UpdateCategoryGroup(ctx context.Context, plan, id, name string) (*
 	}
 	a.InvalidateCategories(plan)
 	return &res.Data.CategoryGroup, nil
+}
+
+// withoutNulls encodes a PATCH body with every null removed. The generated
+// structs have no omitempty on nullable fields, and YNAB reads a null as "clear
+// this field", so an unset pointer would wipe the memo, payee, category or flag
+// the caller never meant to touch.
+func withoutNulls(v any) (io.Reader, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var tree any
+	if err := dec.Decode(&tree); err != nil {
+		return nil, err
+	}
+	out, err := json.Marshal(dropNulls(tree))
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(out), nil
+}
+
+func dropNulls(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, child := range t {
+			if child == nil {
+				delete(t, k)
+				continue
+			}
+			t[k] = dropNulls(child)
+		}
+	case []any:
+		for i, child := range t {
+			t[i] = dropNulls(child)
+		}
+	}
+	return v
 }
